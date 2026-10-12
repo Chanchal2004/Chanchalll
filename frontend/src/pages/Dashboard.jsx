@@ -134,9 +134,9 @@ export default function Dashboard() {
 
   if (data === null) return <Loading />;
 
-  const cards = data ? data.cards : {};
+  const cards = data?.cards ?? {};
   const hasActivity = data?.activity?.length > 0;
-  const deptWithData = depts.filter((d) => d.recipients > 0);
+  const deptWithData = (Array.isArray(depts) ? depts : []).filter((d) => (d?.recipients ?? 0) > 0);
 
 
   const clearAllData = async () => {
@@ -263,7 +263,7 @@ export default function Dashboard() {
 
           {hasActivity ? (
             <ResponsiveContainer width="100%" height={280}>
-              <AreaChart data={data.activity}>
+              <AreaChart data={Array.isArray(data?.activity) ? data.activity : []}>
                 <defs>
                   <linearGradient
                     id="gOpens"
@@ -361,17 +361,17 @@ export default function Dashboard() {
                 data={[
                   {
                     name: "Opens",
-                    value: data.opens_vs_clicks.opens,
+                    value: data?.opens_vs_clicks?.opens ?? 0,
                     fill: "#6366F1",
                   },
                   {
                     name: "Clicks",
-                    value: data.opens_vs_clicks.clicks,
+                    value: data?.opens_vs_clicks?.clicks ?? 0,
                     fill: "#06B6D4",
                   },
                   {
                     name: "Submits",
-                    value: data.opens_vs_clicks.submits,
+                    value: data?.opens_vs_clicks?.submits ?? 0,
                     fill: "#F43F5E",
                   },
                 ]}
@@ -468,7 +468,7 @@ export default function Dashboard() {
 
           {data?.recent_events?.length ? (
             <div className="space-y-2 max-h-[260px] overflow-auto">
-              {data.recent_events.map((e) => (
+              {(Array.isArray(data.recent_events) ? data.recent_events : []).map((e) => (
                 <div
                   key={e.id}
                   className="flex items-center justify-between text-sm py-1.5 border-b border-border/50 last:border-0"
@@ -520,7 +520,7 @@ export default function Dashboard() {
                 </thead>
 
                 <tbody>
-                  {data.recent_simulations.map((s) => (
+                  {(Array.isArray(data.recent_simulations) ? data.recent_simulations : []).map((s) => (
                     <tr
                       key={s.id}
                       className="border-b border-border/50 hover:bg-muted/40"
