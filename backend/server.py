@@ -1496,13 +1496,11 @@ async def _sync_incoming_replies(*, force: bool = False) -> dict:
             {"id": "incoming_replies"}, {"_id": 0}
         )
         start_history_id = state.get("history_id") if state else None
-        last_uid = int(state.get("last_uid") or 0) if state else 0
-
-        # A manual Sync must also recover a reply that was seen by an earlier
-        # background poll but was not fully processed yet.  Keep a small UID
-        # lookback instead of trusting last_uid blindly. Already-saved replies
-        # are deduplicated by message_id below, so this is safe.
-        scan_after_uid = max(0, last_uid - 50) if force else last_uid
+        # Gmail API does not expose IMAP UIDs. Keep this legacy checkpoint at
+        # zero; the Gmail scanner returns the newest inbox messages and this
+        # function deduplicates already-processed messages by Gmail message ID.
+        last_uid = 0
+        scan_after_uid = None
 
         try:
             scan = await find_incoming_replies(
@@ -1564,7 +1562,7 @@ async def _sync_incoming_replies(*, force: bool = False) -> dict:
             incoming_in_reply_to = (item.get("in_reply_to") or "").strip().lower()
             incoming_references = (item.get("references") or "").lower()
 
-            # 1) Best match: exact Graph conversation/thread + sender.
+            # 1) Best match: exact Gmail thread + sender.
             candidates = by_thread.get(thread_id, []) if thread_id else []
             candidate = next(
                 (
@@ -1690,8 +1688,8 @@ async def _sync_incoming_replies(*, force: bool = False) -> dict:
             )
             new_replies += 1
 
-        # Advance the history checkpoint only after the messages have been
-        # processed successfully. This makes transient failures retryable.
+        # Store the legacy sync checkpoint after processing. Gmail messages
+        # are deduplicated by message ID, so retrying the newest page is safe.
         state_update = {"id": "incoming_replies", "last_uid": int(scanned_last_uid or last_uid), "updated_at": now_iso()}
         if history_id:
             state_update["history_id"] = str(history_id)
