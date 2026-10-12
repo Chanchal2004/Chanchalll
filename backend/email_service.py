@@ -7,12 +7,12 @@ import base64
 import asyncio
 import imaplib
 import threading
+from datetime import datetime, timezone
 from email import policy
 from email.parser import BytesParser
 from email.utils import parseaddr, parsedate_to_datetime
 from email.header import decode_header, make_header
 
-import msal
 import httpx
 
 from email.mime.text import MIMEText
@@ -38,6 +38,13 @@ _ZOHO_MAILBOX_LOCK = threading.Lock()
 # ============================================================
 
 GMAIL_TOKEN_JSON = os.environ.get("GMAIL_TOKEN_JSON")
+GMAIL_CLIENT_ID = os.environ.get("GMAIL_CLIENT_ID")
+GMAIL_CLIENT_SECRET = os.environ.get("GMAIL_CLIENT_SECRET")
+GMAIL_REFRESH_TOKEN = os.environ.get("GMAIL_REFRESH_TOKEN")
+GMAIL_TOKEN_URI = os.environ.get(
+    "GMAIL_TOKEN_URI", "https://oauth2.googleapis.com/token"
+)
+GMAIL_ACCESS_TOKEN = os.environ.get("GMAIL_ACCESS_TOKEN")
 
 EMAIL_FROM_NAME = os.environ.get(
     "EMAIL_FROM_NAME",
@@ -46,7 +53,8 @@ EMAIL_FROM_NAME = os.environ.get(
 
 EMAIL_REPLY_TO = os.environ.get("EMAIL_REPLY_TO")
 
-# SEND + READ INCOMING REPLIES / ATTACHMENTS
+# Sending + reading replies requires BOTH scopes on the Google OAuth grant.
+# Re-authorize the Gmail account with these scopes before deploying.
 GMAIL_SCOPES = [
     "https://www.googleapis.com/auth/gmail.send",
     "https://www.googleapis.com/auth/gmail.readonly",
@@ -54,29 +62,10 @@ GMAIL_SCOPES = [
 
 
 # ============================================================
-# MICROSOFT GRAPH SEND CONFIG
-# ============================================================
-
-MICROSOFT_CLIENT_ID = os.environ.get("MICROSOFT_CLIENT_ID")
-MICROSOFT_TENANT_ID = os.environ.get("MICROSOFT_TENANT_ID")
-MICROSOFT_AUTHORITY = os.environ.get(
-    "MICROSOFT_AUTHORITY",
-    "https://login.microsoftonline.com/common",
-)
-MICROSOFT_SENDER_EMAIL = os.environ.get(
-    "MICROSOFT_SENDER_EMAIL",
-    "chanchal@qhtalbros.com",
-)
-MICROSOFT_TOKEN_CACHE = os.environ.get("MICROSOFT_TOKEN_CACHE")
-MICROSOFT_SCOPES = ["Mail.Send", "Mail.ReadWrite"]
-
-
-# ============================================================
 # ZOHO IMAP INCOMING REPLY CONFIG
 # ============================================================
-# Incoming mail for qhtalbros.com is being delivered to Zoho.
-# We therefore read replies/attachments from the Zoho mailbox via IMAP.
-# Microsoft Graph remains the outbound sender.
+# Legacy Zoho IMAP settings are retained for compatibility only.
+# New outbound mail and reply scanning use the authenticated Gmail API.
 
 ZOHO_IMAP_HOST = os.environ.get("ZOHO_IMAP_HOST", "imappro.zoho.in")
 ZOHO_IMAP_PORT = int(os.environ.get("ZOHO_IMAP_PORT", "993"))
@@ -85,18 +74,15 @@ ZOHO_IMAP_PASSWORD = os.environ.get("ZOHO_IMAP_PASSWORD", "")
 ZOHO_IMAP_FOLDER = os.environ.get("ZOHO_IMAP_FOLDER", "INBOX")
 
 # When Zoho IMAP is configured, force replies to the same Zoho mailbox.
-# Otherwise fall back to EMAIL_REPLY_TO / Microsoft sender.
+# Replies are tracked in the authenticated Gmail inbox.
 INBOUND_REPLY_EMAIL = (
-    ZOHO_IMAP_EMAIL
-    or EMAIL_REPLY_TO
-    or MICROSOFT_SENDER_EMAIL
+    EMAIL_REPLY_TO
+    or "chanchalchaudhary0101@gmail.com"
 )
 
 
 # Keep the MSAL cache in memory for the lifetime of the Render process.
 # The initial serialized cache is supplied through Render Environment Variables.
-_microsoft_token_cache = None
-_microsoft_msal_app = None
 
 
 # ============================================================
@@ -332,82 +318,60 @@ def assert_safe_email(
 # ============================================================
 
 def _get_gmail_service():
-
-    if not GMAIL_TOKEN_JSON:
-
-        raise RuntimeError(
-            "GMAIL_TOKEN_JSON is not set in Render Environment Variables."
-        )
-
+    """Create a Gmail API client from JSON or separate Render env vars."""
     try:
-
-        token_data = json.loads(
-            GMAIL_TOKEN_JSON
-        )
-
-    except json.JSONDecodeError as exc:
-
-        raise RuntimeError(
-            f"GMAIL_TOKEN_JSON is not valid JSON: {exc}"
-        ) from exc
-
-    try:
-
-        credentials = Credentials.from_authorized_user_info(
-            token_data,
-            GMAIL_SCOPES,
-        )
-
-    except Exception as exc:
-
-        raise RuntimeError(
-            f"Could not load Gmail credentials from "
-            f"GMAIL_TOKEN_JSON: {exc}"
-        ) from exc
-
-    # --------------------------------------------------------
-    # Refresh expired access token
-    # --------------------------------------------------------
-
-    if (
-        credentials.expired
-        and credentials.refresh_token
-    ):
-
-        try:
-
-            credentials.refresh(
-                Request()
+        if GMAIL_CLIENT_ID and GMAIL_CLIENT_SECRET and GMAIL_REFRESH_TOKEN:
+            credentials = Credentials(
+                token=GMAIL_ACCESS_TOKEN,
+                refresh_token=GMAIL_REFRESH_TOKEN,
+                token_uri=GMAIL_TOKEN_URI,
+                client_id=GMAIL_CLIENT_ID,
+                client_secret=GMAIL_CLIENT_SECRET,
+                scopes=GMAIL_SCOPES,
             )
-
-            logger.info(
-                "Gmail access token refreshed successfully."
+        elif GMAIL_TOKEN_JSON:
+            token_data = json.loads(GMAIL_TOKEN_JSON)
+            credentials = Credentials.from_authorized_user_info(
+                token_data,
+                GMAIL_SCOPES,
             )
-
-        except Exception as exc:
-
-            logger.exception(
-                "Gmail token refresh failed."
-            )
-
+        else:
             raise RuntimeError(
-                f"Gmail token refresh failed: {exc}"
+                "Set GMAIL_CLIENT_ID, GMAIL_CLIENT_SECRET and GMAIL_REFRESH_TOKEN "
+                "in Render Environment Variables (or provide GMAIL_TOKEN_JSON)."
+            )
+    except json.JSONDecodeError as exc:
+        raise RuntimeError("GMAIL_TOKEN_JSON is not valid JSON.") from exc
+    except Exception as exc:
+        if isinstance(exc, RuntimeError):
+            raise
+        raise RuntimeError(f"Could not load Gmail credentials: {exc}") from exc
+
+    if credentials.refresh_token and (
+        not credentials.token or credentials.expired
+    ):
+        try:
+            credentials.refresh(Request())
+            logger.info("Gmail access token refreshed successfully.")
+        except Exception as exc:
+            logger.exception("Gmail token refresh failed.")
+            raise RuntimeError(
+                "Gmail token refresh failed. Check the new Client ID, Client Secret, "
+                "Refresh Token and Gmail API scopes."
             ) from exc
 
     if not credentials.valid:
-
         raise RuntimeError(
-            "Gmail credentials are invalid or expired."
+            "Gmail credentials are invalid. Re-authorize with gmail.send and "
+            "gmail.readonly scopes and update Render variables."
         )
 
-    service = build(
+    return build(
         "gmail",
         "v1",
         credentials=credentials,
         cache_discovery=False,
     )
-
-    return service
 
 
 # ============================================================
@@ -437,77 +401,7 @@ async def get_gmail_account_email() -> str:
 
 
 # ============================================================
-# MICROSOFT GRAPH TOKEN / CLIENT
-# ============================================================
-
-def _get_microsoft_msal_app():
-    global _microsoft_token_cache, _microsoft_msal_app
-
-    if _microsoft_msal_app is not None:
-        return _microsoft_msal_app
-
-    if not MICROSOFT_CLIENT_ID:
-        raise RuntimeError(
-            "MICROSOFT_CLIENT_ID is not set in Render Environment Variables."
-        )
-
-    if not MICROSOFT_TOKEN_CACHE:
-        raise RuntimeError(
-            "MICROSOFT_TOKEN_CACHE is not set in Render Environment Variables. "
-            "Put the serialized MSAL token cache here; do not put only an access token."
-        )
-
-    _microsoft_token_cache = msal.SerializableTokenCache()
-
-    try:
-        _microsoft_token_cache.deserialize(MICROSOFT_TOKEN_CACHE)
-    except Exception as exc:
-        raise RuntimeError(
-            f"MICROSOFT_TOKEN_CACHE is not a valid MSAL token cache: {exc}"
-        ) from exc
-
-    _microsoft_msal_app = msal.PublicClientApplication(
-        client_id=MICROSOFT_CLIENT_ID,
-        authority=MICROSOFT_AUTHORITY,
-        token_cache=_microsoft_token_cache,
-    )
-
-    return _microsoft_msal_app
-
-
-def _get_microsoft_access_token() -> str:
-    app = _get_microsoft_msal_app()
-
-    accounts = app.get_accounts(username=MICROSOFT_SENDER_EMAIL)
-
-    if not accounts:
-        raise RuntimeError(
-            "No Microsoft login account was found in MICROSOFT_TOKEN_CACHE. "
-            "Run the local Microsoft login/token-cache generator again and copy the "
-            "complete MSAL cache JSON into Render."
-        )
-
-    result = app.acquire_token_silent(
-        MICROSOFT_SCOPES,
-        account=accounts[0],
-    )
-
-    if not result or "access_token" not in result:
-        error = (result or {}).get("error_description") or (result or {}).get("error")
-        raise RuntimeError(
-            "Microsoft token acquisition failed."
-            + (f" {error}" if error else "")
-        )
-
-    logger.info(
-        "Microsoft Graph access token acquired successfully for %s.",
-        MICROSOFT_SENDER_EMAIL,
-    )
-    return result["access_token"]
-
-
-# ============================================================
-# SEND EMAIL WITH MICROSOFT GRAPH API
+# SEND EMAIL WITH GMAIL API
 # ============================================================
 
 async def send_email(
@@ -517,71 +411,71 @@ async def send_email(
     html: str,
     reply_to: str | None = None,
 ) -> dict:
-    """Send outbound mail through the existing Microsoft Graph setup.
-
-    Zoho IMAP is used only for inbound reply sync.
-    """
+    """Send one authorized message using the configured Gmail account."""
     assert_safe_email(subject, html)
-    final_reply_to = reply_to or INBOUND_REPLY_EMAIL
-    access_token = _get_microsoft_access_token()
+    final_reply_to = reply_to or EMAIL_REPLY_TO or "chanchalchaudhary0101@gmail.com"
 
-    message = {
-        "subject": subject,
-        "body": {"contentType": "HTML", "content": html},
-        "toRecipients": [{"emailAddress": {"address": to}}],
-    }
-    if final_reply_to:
-        message["replyTo"] = [{"emailAddress": {"address": final_reply_to}}]
-
-    headers = {
-        "Authorization": f"Bearer {access_token}",
-        "Content-Type": "application/json",
-    }
-
-    async with httpx.AsyncClient(timeout=30.0) as client:
-        create_response = await client.post(
-            "https://graph.microsoft.com/v1.0/me/messages",
-            headers=headers,
-            json=message,
+    def _send_sync():
+        gmail_service = _get_gmail_service()
+        sender = (
+            gmail_service.users()
+            .getProfile(userId="me")
+            .execute()
+            .get("emailAddress", "")
         )
-        if create_response.status_code not in (200, 201):
-            try:
-                detail = create_response.json()
-            except Exception:
-                detail = create_response.text
+        if sender.lower() != "chanchalchaudhary0101@gmail.com":
             raise RuntimeError(
-                f"Microsoft Graph draft creation failed (HTTP {create_response.status_code}): {detail}"
+                "The connected Gmail account is not chanchalchaudhary0101@gmail.com. "
+                "Authorize the correct Gmail account and update the OAuth credentials."
             )
 
-        created = create_response.json()
-        message_id = created.get("id")
-        conversation_id = created.get("conversationId")
-        internet_message_id = created.get("internetMessageId")
-        if not message_id:
-            raise RuntimeError("Microsoft Graph did not return a message ID.")
-
-        send_response = await client.post(
-            f"https://graph.microsoft.com/v1.0/me/messages/{message_id}/send",
-            headers=headers,
+        message = MIMEMultipart("alternative")
+        message["To"] = to
+        message["From"] = f"{EMAIL_FROM_NAME} <{sender}>" if EMAIL_FROM_NAME else sender
+        message["Subject"] = subject
+        if final_reply_to:
+            message["Reply-To"] = final_reply_to
+        message.attach(MIMEText(_html_to_text(html), "plain", "utf-8"))
+        message.attach(MIMEText(html, "html", "utf-8"))
+        raw = base64.urlsafe_b64encode(message.as_bytes()).decode("ascii")
+        result = (
+            gmail_service.users()
+            .messages()
+            .send(userId="me", body={"raw": raw})
+            .execute()
         )
-        if send_response.status_code != 202:
+        message_id = result.get("id")
+        thread_id = result.get("threadId")
+        internet_message_id = None
+        if message_id:
             try:
-                detail = send_response.json()
+                metadata = (
+                    gmail_service.users()
+                    .messages()
+                    .get(
+                        userId="me",
+                        id=message_id,
+                        format="metadata",
+                        metadataHeaders=["Message-ID"],
+                    )
+                    .execute()
+                )
+                headers = (metadata.get("payload") or {}).get("headers", [])
+                internet_message_id = next(
+                    (h.get("value") for h in headers if h.get("name", "").lower() == "message-id"),
+                    None,
+                )
             except Exception:
-                detail = send_response.text
-            raise RuntimeError(
-                f"Microsoft Graph send failed (HTTP {send_response.status_code}): {detail}"
-            )
+                logger.warning("Could not retrieve Gmail Message-ID for sent message %s", message_id)
+        return {
+            "id": message_id,
+            "thread_id": thread_id,
+            "internet_message_id": internet_message_id,
+        }
 
-    logger.info(
-        "Email accepted by Microsoft Graph for %s from %s (message=%s, conversation=%s)",
-        to, MICROSOFT_SENDER_EMAIL, message_id, conversation_id,
-    )
-    return {
-        "id": message_id,
-        "thread_id": conversation_id,
-        "internet_message_id": internet_message_id,
-    }
+    result = await asyncio.to_thread(_send_sync)
+    logger.info("Gmail API accepted message to %s (message=%s)", to, result.get("id"))
+    return result
 
 
 def _html_to_text(value: str) -> str:
@@ -833,7 +727,7 @@ def _zoho_fetch_uid_sync(mailbox, uid: bytes | str, *, headers_only: bool = Fals
 
     Full BODY.PEEK[] is intentionally reserved for a message that the server
     has already matched to a sent simulation recipient. This avoids downloading
-    attachments for unrelated Microsoft security alerts and other inbox noise.
+    attachments for unrelated inbox notifications and other mailbox noise.
     """
     uid_text = uid.decode() if isinstance(uid, bytes) else str(uid)
     fetch_spec = (
@@ -929,209 +823,95 @@ async def find_incoming_replies(
     max_results: int = 100,
     after_uid: int | None = None,
 ) -> _ReplyScan:
-    """Find replies from the mailbox that actually receives qhtalbros.com mail.
-
-    The current domain mail is landing in Zoho, so Zoho IMAP is the primary
-    inbound source. Microsoft Graph remains the outbound sender. The Graph
-    fallback is retained only for installations where Zoho IMAP variables are
-    not configured.
-    """
-    del start_history_id
-    del after_message_id
-
+    """List recent incoming Gmail inbox messages for reply matching."""
+    del start_history_id, after_message_id, after_uid
     limit = max(1, min(int(max_results or 100), 100))
 
-    if _zoho_ready():
-        logger.info(
-            "Checking Zoho IMAP inbox %s for incoming replies.",
-            ZOHO_IMAP_EMAIL,
+    def _scan_sync():
+        service = _get_gmail_service()
+        response = (
+            service.users()
+            .messages()
+            .list(userId="me", q="in:inbox -from:me", maxResults=limit)
+            .execute()
         )
-        result = await asyncio.to_thread(
-            _zoho_find_incoming_sync,
-            limit,
-            after_uid,
-        )
-        logger.info(
-            "Zoho IMAP incoming scan found %d message(s).",
-            len(result),
-        )
-        return result
-
-    # No Zoho credentials: preserve the Microsoft Graph path as a fallback.
-    access_token = _get_microsoft_access_token()
-    select = (
-        "id,conversationId,internetMessageId,subject,from,toRecipients,"
-        "receivedDateTime,body,hasAttachments,parentFolderId,internetMessageHeaders"
-    )
-
-    headers = _graph_headers(access_token)
-    urls = [
-        "https://graph.microsoft.com/v1.0/me/mailFolders/inbox/messages",
-        "https://graph.microsoft.com/v1.0/me/messages",
-    ]
-
-    seen_ids: set[str] = set()
-    output = _ReplyScan()
-    own_sender = _normalize_email_address(MICROSOFT_SENDER_EMAIL)
-
-    async with httpx.AsyncClient(timeout=30.0) as client:
-        for url_index, url in enumerate(urls):
-            next_url = url
-            params = {
-                "$top": "100",
-                "$orderby": "receivedDateTime desc",
-                "$select": select,
+        output = _ReplyScan()
+        output.last_uid = 0
+        for row in response.get("messages", []):
+            message_id = row.get("id")
+            if not message_id:
+                continue
+            msg = (
+                service.users()
+                .messages()
+                .get(userId="me", id=message_id, format="metadata",
+                     metadataHeaders=["From", "To", "Subject", "Date",
+                                      "Message-ID", "In-Reply-To", "References"])
+                .execute()
+            )
+            payload = msg.get("payload") or {}
+            headers = {
+                str(h.get("name", "")).lower(): h.get("value", "")
+                for h in payload.get("headers", [])
             }
-            pages = 0
+            output.append({
+                "id": message_id,
+                "thread_id": msg.get("threadId"),
+                "from": headers.get("from", ""),
+                "to": headers.get("to", ""),
+                "subject": headers.get("subject", ""),
+                "date": headers.get("date", ""),
+                "in_reply_to": headers.get("in-reply-to", ""),
+                "references": headers.get("references", ""),
+                "internet_message_id": headers.get("message-id", ""),
+            })
+        return output
 
-            while next_url and len(output) < limit and pages < 10:
-                response = await client.get(
-                    next_url,
-                    headers=headers,
-                    params=params if next_url == url else None,
-                )
-                pages += 1
-
-                if response.status_code != 200:
-                    try:
-                        detail = response.json()
-                    except Exception:
-                        detail = response.text
-                    logger.warning(
-                        "Microsoft Graph mail scan failed for %s (HTTP %s): %s",
-                        next_url,
-                        response.status_code,
-                        detail,
-                    )
-                    if url_index == 0:
-                        break
-                    raise RuntimeError(
-                        f"Microsoft Graph mailbox read failed (HTTP {response.status_code}): {detail}"
-                    )
-
-                data = response.json()
-                messages = data.get("value", [])
-
-                for message in messages:
-                    message_id = message.get("id")
-                    if not message_id or message_id in seen_ids:
-                        continue
-                    seen_ids.add(message_id)
-
-                    sender = _graph_address(message.get("from") or {})
-                    if own_sender and _normalize_email_address(sender) == own_sender:
-                        continue
-
-                    body = message.get("body") or {}
-                    body_type = (body.get("contentType") or "").lower()
-                    body_content = body.get("content") or ""
-                    reply_text = (
-                        _html_to_text(body_content)
-                        if body_type == "html"
-                        else body_content.strip()
-                    )
-
-                    recipients = [
-                        _graph_address(x)
-                        for x in (message.get("toRecipients") or [])
-                    ]
-
-                    headers_map = {}
-                    for h in message.get("internetMessageHeaders") or []:
-                        name = (h.get("name") or "").lower().strip()
-                        if name:
-                            headers_map[name] = h.get("value") or ""
-
-                    output.append({
-                        "id": message_id,
-                        "thread_id": message.get("conversationId"),
-                        "internet_message_id": message.get("internetMessageId"),
-                        "in_reply_to": headers_map.get("in-reply-to", ""),
-                        "references": headers_map.get("references", ""),
-                        "from": sender,
-                        "to": ", ".join(x for x in recipients if x),
-                        "subject": message.get("subject") or "",
-                        "date": message.get("receivedDateTime") or "",
-                        "body": body_content,
-                        "body_type": body_type,
-                        "reply_text": reply_text,
-                        "has_attachments": bool(message.get("hasAttachments")),
-                        "parent_folder_id": message.get("parentFolderId"),
-                    })
-
-                next_url = data.get("@odata.nextLink")
-                params = None
-
-                if not messages or not next_url:
-                    break
-
-    output.sort(key=lambda item: item.get("date") or "", reverse=True)
-    return output[:limit]
+    result = await asyncio.to_thread(_scan_sync)
+    logger.info("Gmail inbox reply scan found %d message(s).", len(result))
+    return result
 
 
 async def get_message_attachments(message_id: str) -> list[dict]:
-    """Download attachments for a reply message from Zoho or Graph."""
-    if message_id.startswith("zoho:") or message_id.startswith("zoho-uid:"):
-        details = await get_incoming_message_details(message_id)
-        return details.get("attachments", [])
+    """Download file attachments from a Gmail message."""
+    def _get_sync():
+        service = _get_gmail_service()
+        message = service.users().messages().get(
+            userId="me", id=message_id, format="full"
+        ).execute()
+        results = []
 
-    access_token = _get_microsoft_access_token()
-    url = f"https://graph.microsoft.com/v1.0/me/messages/{message_id}/attachments"
+        def walk(part):
+            filename = part.get("filename") or ""
+            body = part.get("body") or {}
+            mime_type = part.get("mimeType") or "application/octet-stream"
+            data = body.get("data")
+            attachment_id = body.get("attachmentId")
+            if filename:
+                if data:
+                    raw = base64.urlsafe_b64decode(data + "=" * (-len(data) % 4))
+                elif attachment_id:
+                    item = service.users().messages().attachments().get(
+                        userId="me", messageId=message_id, id=attachment_id
+                    ).execute()
+                    encoded = item.get("data") or ""
+                    raw = base64.urlsafe_b64decode(encoded + "=" * (-len(encoded) % 4))
+                else:
+                    raw = b""
+                if raw:
+                    results.append({
+                        "filename": filename,
+                        "mime_type": mime_type,
+                        "data": raw,
+                        "size": len(raw),
+                    })
+            for child in part.get("parts", []) or []:
+                walk(child)
 
-    async with httpx.AsyncClient(timeout=60.0) as client:
-        response = await client.get(
-            url,
-            headers=_graph_headers(access_token),
-            params={"$top": "100"},
-        )
+        walk(message.get("payload") or {})
+        return results
 
-    if response.status_code != 200:
-        try:
-            detail = response.json()
-        except Exception:
-            detail = response.text
-        raise RuntimeError(
-            f"Microsoft Graph attachment list failed (HTTP {response.status_code}): {detail}"
-        )
-
-    results = []
-    for item in response.json().get("value", []):
-        if item.get("@odata.type", "") != "#microsoft.graph.fileAttachment":
-            continue
-
-        content_bytes = item.get("contentBytes")
-        attachment_id = item.get("id")
-        filename = item.get("name") or "attachment"
-        mime_type = item.get("contentType") or "application/octet-stream"
-
-        if not content_bytes and attachment_id:
-            async with httpx.AsyncClient(timeout=60.0) as client:
-                one = await client.get(
-                    f"{url}/{attachment_id}",
-                    headers=_graph_headers(access_token),
-                )
-            if one.status_code != 200:
-                continue
-            item = one.json()
-            content_bytes = item.get("contentBytes")
-
-        if not content_bytes:
-            continue
-
-        try:
-            file_data = base64.b64decode(content_bytes)
-        except Exception:
-            logger.exception("Could not decode Microsoft attachment %s", filename)
-            continue
-
-        results.append({
-            "filename": filename,
-            "mime_type": mime_type,
-            "data": file_data,
-            "size": len(file_data),
-        })
-
-    return results
+    return await asyncio.to_thread(_get_sync)
 
 
 async def get_incoming_message_details(
@@ -1151,64 +931,62 @@ async def get_incoming_message_details(
             uid_or_message_id,
         )
 
-    access_token = _get_microsoft_access_token()
-    url = f"https://graph.microsoft.com/v1.0/me/messages/{message_id}"
-    params = {
-        "$select": (
-            "id,conversationId,internetMessageId,subject,from,toRecipients,"
-            "receivedDateTime,body,hasAttachments"
+    def _get_sync():
+        service = _get_gmail_service()
+        message = service.users().messages().get(
+            userId="me", id=message_id, format="full"
+        ).execute()
+        payload = message.get("payload") or {}
+        headers = {
+            str(h.get("name", "")).lower(): h.get("value", "")
+            for h in payload.get("headers", [])
+        }
+        text_parts = []
+        html_parts = []
+
+        def walk(part):
+            mime_type = (part.get("mimeType") or "").lower()
+            body = part.get("body") or {}
+            data = body.get("data")
+            if data and not part.get("filename"):
+                try:
+                    decoded = base64.urlsafe_b64decode(
+                        data + "=" * (-len(data) % 4)
+                    ).decode("utf-8", errors="replace")
+                    if mime_type == "text/plain":
+                        text_parts.append(decoded)
+                    elif mime_type == "text/html":
+                        html_parts.append(decoded)
+                except Exception:
+                    logger.exception("Could not decode Gmail message body.")
+            for child in part.get("parts", []) or []:
+                walk(child)
+
+        walk(payload)
+        body_content = "\\n".join(text_parts) or "\\n".join(html_parts)
+        reply_text = _html_to_text(body_content) if html_parts and not text_parts else body_content.strip()
+        received_ms = message.get("internalDate")
+        received_date = (
+            datetime.fromtimestamp(int(received_ms) / 1000, tz=timezone.utc).isoformat()
+            if received_ms else headers.get("date", "")
         )
-    }
+        return {
+            "id": message.get("id") or message_id,
+            "thread_id": message.get("threadId"),
+            "internet_message_id": headers.get("message-id"),
+            "from": headers.get("from", ""),
+            "to": headers.get("to", ""),
+            "subject": headers.get("subject", ""),
+            "date": received_date,
+            "body": body_content,
+            "body_type": "html" if html_parts and not text_parts else "text",
+            "reply_text": reply_text,
+            "attachments": [],
+        }
 
-    async with httpx.AsyncClient(timeout=60.0) as client:
-        response = await client.get(
-            url,
-            headers=_graph_headers(access_token),
-            params=params,
-        )
-
-    if response.status_code != 200:
-        try:
-            detail = response.json()
-        except Exception:
-            detail = response.text
-        raise RuntimeError(
-            f"Microsoft Graph message read failed (HTTP {response.status_code}): {detail}"
-        )
-
-    message = response.json()
-    body = message.get("body") or {}
-    body_type = (body.get("contentType") or "").lower()
-    body_content = body.get("content") or ""
-    reply_text = (
-        _html_to_text(body_content)
-        if body_type == "html"
-        else body_content.strip()
-    )
-
-    attachments = []
-    if message.get("hasAttachments"):
-        attachments = await get_message_attachments(message_id)
-
-    sender = _graph_address(message.get("from") or {})
-    recipients = [
-        _graph_address(x)
-        for x in (message.get("toRecipients") or [])
-    ]
-
-    return {
-        "id": message.get("id") or message_id,
-        "thread_id": message.get("conversationId"),
-        "internet_message_id": message.get("internetMessageId"),
-        "from": sender,
-        "to": ", ".join(x for x in recipients if x),
-        "subject": message.get("subject") or "",
-        "date": message.get("receivedDateTime") or "",
-        "body": body_content,
-        "body_type": body_type,
-        "reply_text": reply_text,
-        "attachments": attachments,
-    }
+    details = await asyncio.to_thread(_get_sync)
+    details["attachments"] = await get_message_attachments(message_id)
+    return details
 
 
 def _zoho_get_message_details_sync(message_id: str) -> dict:
