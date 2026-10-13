@@ -478,6 +478,19 @@ async def send_email(
     return result
 
 
+class _HTMLTextParser(HTMLParser):
+    """Convert HTML email content into readable plain text."""
+
+    def __init__(self):
+        super().__init__()
+        self.parts = []
+
+    def handle_data(self, data):
+        text = data.strip()
+        if text:
+            self.parts.append(text)
+
+
 def _html_to_text(value: str) -> str:
     if not value:
         return ""
